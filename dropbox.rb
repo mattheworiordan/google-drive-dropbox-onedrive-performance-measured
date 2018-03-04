@@ -1,5 +1,11 @@
 #!/usr/bin/env ruby
 
+##
+# Note this glorified bash script is rather unwieldy now.
+# Given this is throw away code though and I have no intention to extend this code in future,
+# I will  regrettably be leaving this pretty horrible (but functional) script as is.
+
+require 'fileutils'
 require 'securerandom'
 
 require 'dropbox_api'
@@ -14,8 +20,9 @@ require 'thread'
 MUTEX = Mutex.new
 
 PERF_FOLDER = 'DropboxPerfTest'
-DRIVE_HOME_FOLDER = '~/Dropbox'
+DROPBOX_HOME_FOLDER = '~/Dropbox'
 FILE_NAME_PREFIX = 'iteration'
+FILE_NAME_ITERATION_MATCHER = /^\s*#{FILE_NAME_PREFIX}-(\d+)/
 
 TEST_ID = SecureRandom.hex(3)
 WEB_SERVER_PORT = rand(10000) + 10000
@@ -24,6 +31,9 @@ TEST_PAUSE_RANGE = 15
 
 WEB_SERVER_STATE = {}
 ITERATION_HISTORY = []
+
+total_sync_time_from_start = Hash.new { |hsh, key| hsh[key] = 0 }
+total_sync_time_from_completed = Hash.new { |hsh, key| hsh[key] = 0 }
 
 class SinatraServer < Sinatra::Base
   set :port, WEB_SERVER_PORT
@@ -38,10 +48,15 @@ class SinatraServer < Sinatra::Base
     WEB_SERVER_STATE[:ready] = true
   end
 
+  get '/empty' do
+    headers 'Access-Control-Allow-Origin' => '*'
+    WEB_SERVER_STATE[:empty] = true
+  end
+
   get '/sync' do
     headers 'Access-Control-Allow-Origin' => '*'
     MUTEX.synchronize do
-      iteration_id = params['fileName'][/^\s*#{FILE_NAME_PREFIX}-(\d+)/, 1]
+      iteration_id = params['fileName'][FILE_NAME_ITERATION_MATCHER, 1]
       timestamp = params['ts'].to_i
       if !iteration_id || !timestamp || (timestamp <= 0)
         puts "Error! Invalid params received on endpoint /sync: #{params}"
@@ -105,6 +120,12 @@ javascript = <<EOM
     let filesSelector = 'table.mc-table.brws-files-view-list tr.brws-file-row';
     let filesByName = [];
 
+    let getFn = (path) => {
+      let request = new XMLHttpRequest();
+      request.open('GET', `#{Ngrok::Tunnel.ngrok_url_https}/${path}`);
+      request.send();
+    };
+
     if (!folder) { throw('Could not find listbox DOM element. Did you run this script before the page rendered?'); }
 
     /* Ignore existing files, only monitor new ones */
@@ -116,14 +137,16 @@ javascript = <<EOM
         let fileName = element.getAttribute('data-filename');
         if (fileName) {
           if (!filesByName.includes(fileName)) {
-            let request = new XMLHttpRequest();
-            request.open('GET', `#{Ngrok::Tunnel.ngrok_url_https}/sync?fileName=${fileName}&ts=${new Date().getTime()}`);
-            request.send();
+            getFn(`sync?fileName=${fileName}&ts=${new Date().getTime()}`);
             filesByName.push(fileName);
             console.log(`Detected new file: '${fileName}' at ${new Date()}`);
           }
         }
       });
+      if ((files.length === 0) && (filesByName.length !== 0)) {
+        filesByName = [];
+        getFn('empty');
+      }
     }, 100);
 
     function stopPerfTimer() {
@@ -133,10 +156,7 @@ javascript = <<EOM
     if (document.stopPerfTimer) { document.stopPerfTimer(); }
     document.stopPerfTimer = stopPerfTimer;
 
-    let request = new XMLHttpRequest();
-    request.open('GET', `#{Ngrok::Tunnel.ngrok_url_https}/ready`);
-    request.send();
-
+    getFn('ready');
     console.log('Now monitoring files and their create timestamps. Run `document.stopPerfTimer()` when done');
   })();
 EOM
@@ -153,13 +173,13 @@ while !WEB_SERVER_STATE[:ready]
   sleep 2
 end
 
-puts "\n\nTest will now commence by uploading #{TEST_ITERATIONS} files to Dropbox"
+puts "\n\nFirst test will now commence by uploading #{TEST_ITERATIONS} files to Dropbox via the API and we'll measure how long it takes for those files to appear in the web view."
 
 TEST_ITERATIONS.times do |index|
   iteration_data = { id: index, upload_started_at: Time.now }
   ITERATION_HISTORY << iteration_data
   dropbox_client.upload "#{test_folder_path}/#{FILE_NAME_PREFIX}-#{index}.txt", "<empty>"
-  iteration_data[:upload_completed_at] = Time.now
+  MUTEX.synchronize { iteration_data[:upload_completed_at] = Time.now }
   next_pause = rand(TEST_PAUSE_RANGE).round
   puts "Uploaded test file with index #{index} successfully in #{(iteration_data.fetch(:upload_completed_at).to_f - iteration_data.fetch(:upload_started_at).to_f).round(2)}s. Pausing #{next_pause}s before next upload."
   sleep next_pause
@@ -168,18 +188,130 @@ end
 puts "\n\nWaiting for files to be synchronized..."
 sleep 1 while (ITERATION_HISTORY.length != TEST_ITERATIONS) || !ITERATION_HISTORY.all? { |iteration| iteration[:web_sync_at] }
 
-puts "\n\nDropbox performance test complete:\n\n"
+puts "\n\nDropbox API to web performance test complete:\n\n"
 puts "#{ITERATION_HISTORY.first.keys.join(',')},web_sync_duration_from_upload_start,web_sync_duration_from_upload_complete"
-total_sync_time_from_start = 0
-total_sync_time_from_completed = 0
+
 ITERATION_HISTORY.each do |iteration|
   web_sync_duration_from_completed = iteration.fetch(:web_sync_at).to_f - iteration.fetch(:upload_completed_at).to_f
   web_sync_duration_from_start = iteration.fetch(:web_sync_at).to_f - iteration.fetch(:upload_started_at).to_f
-  total_sync_time_from_start += web_sync_duration_from_start
-  total_sync_time_from_completed += web_sync_duration_from_completed
+  total_sync_time_from_start[:api_to_web] += web_sync_duration_from_start
+  total_sync_time_from_completed[:api_to_web] += web_sync_duration_from_completed
   puts (iteration.values + [web_sync_duration_from_start, web_sync_duration_from_completed]).join(',')
 end
 
+print "\n\nNow deleting the uploaded files to free up space in the UI for the next test."
+test_files_created = dropbox_client.list_folder(test_folder_path).entries
+test_files_created.each do |file|
+  dropbox_client.delete file.path_lower
+  print '.'
+end
+print "\nAll #{test_files_created.length} files deleted. \nWaiting for confirmation from the browser script that the Web UI is now clear (make sure the window has focus and don't reload!)."
+while !WEB_SERVER_STATE[:empty]
+  print '.'
+  $stdout.flush
+  sleep 2
+end
+
+puts "\n\n\nSecond test will now commence by writing #{TEST_ITERATIONS} files to the local drive and we'll measure how long it takes for those files to appear in the web view."
+local_test_folder_path = File.join(File.expand_path(DROPBOX_HOME_FOLDER), test_folder_path)
+FileUtils.mkdir_p local_test_folder_path
+
+test_offset = TEST_ITERATIONS
+TEST_ITERATIONS.times do |times_index|
+  index = times_index + test_offset
+  iteration_data = { id: index, upload_started_at: Time.now }
+  ITERATION_HISTORY << iteration_data
+  File.write File.expand_path("#{FILE_NAME_PREFIX}-#{index}.txt", local_test_folder_path), '<empty>'
+  MUTEX.synchronize { iteration_data[:upload_completed_at] = Time.now }
+  next_pause = rand(TEST_PAUSE_RANGE).round
+  puts "Created test file with index #{index} successfully in #{local_test_folder_path}. Pausing #{next_pause}s before next file creation."
+  sleep next_pause
+end
+
+puts "\n\nWaiting for files to be synchronized..."
+sleep 1 while (ITERATION_HISTORY.length != (TEST_ITERATIONS + test_offset)) || !ITERATION_HISTORY.all? { |iteration| iteration[:web_sync_at] }
+
+puts "\n\nLocal drive file to web performance test complete:\n\n"
+puts "#{ITERATION_HISTORY.first.keys.join(',')},web_sync_duration_from_upload_start,web_sync_duration_from_upload_complete"
+
+ITERATION_HISTORY.each do |iteration|
+  next if iteration.fetch(:id) < test_offset
+  web_sync_duration_from_completed = iteration.fetch(:web_sync_at).to_f - iteration.fetch(:upload_completed_at).to_f
+  web_sync_duration_from_start = iteration.fetch(:web_sync_at).to_f - iteration.fetch(:upload_started_at).to_f
+  total_sync_time_from_start[:local_drive_to_web] += web_sync_duration_from_start
+  total_sync_time_from_completed[:local_drive_to_web] += web_sync_duration_from_completed
+  puts (iteration.values + [web_sync_duration_from_start, web_sync_duration_from_completed]).join(',')
+end
+
+puts "\n\n\nFinal test will now commence by deleting #{TEST_ITERATIONS} files from the API and seeing how long it takes to reflect these changes locally"
+LOCAL_DELETE_STATUS = { ready: false }
+file_checker_thread = Thread.new do
+  existing_files = Dir["#{local_test_folder_path}/#{FILE_NAME_PREFIX}*"]
+  while existing_files.length > 0
+    current_files = Dir["#{local_test_folder_path}/#{FILE_NAME_PREFIX}*"]
+    (existing_files - current_files).each do |file|
+      filename = File.basename(file)
+      iteration_id = filename[FILE_NAME_ITERATION_MATCHER, 1]
+      if !iteration_id
+        puts "Error! Unrecognise file has been deleted '#{fileanme}'"
+      else
+        iteration = ITERATION_HISTORY.find { |it| it.fetch(:id) == iteration_id.to_i }
+        if !iteration
+          puts "Error! Invalid iteration ID #{iteration_id}, missing from ITERATION_HISTORY"
+        else
+          MUTEX.synchronize { iteration[:local_deleted_at] = Time.now }
+          puts " ✓ Iteration #{iteration_id} deleted locally #{(iteration.fetch(:local_deleted_at).to_f - iteration.fetch(:api_delete_started_at).to_f).round(2)}s after API delete started"
+        end
+      end
+    end
+    existing_files = current_files
+    sleep 0.1
+  end
+  LOCAL_DELETE_STATUS[:ready] = true
+end
+
+test_files_created = dropbox_client.list_folder(test_folder_path).entries
+test_files_created.each do |file|
+  filename = file.name
+  index = filename[FILE_NAME_ITERATION_MATCHER, 1]
+  if !index
+    puts "Error! Remote file is an unrecognised format: '#{file.name}'"
+  else
+    iteration_data = ITERATION_HISTORY.find { |it| it.fetch(:id) == index.to_i }
+    MUTEX.synchronize { iteration_data[:api_delete_started_at] = Time.now }
+    dropbox_client.delete file.path_lower
+    MUTEX.synchronize { iteration_data[:api_delete_completed_at] = Time.now }
+    next_pause = rand(TEST_PAUSE_RANGE).round
+    puts "Delete test file with index #{index} successfully via API. Pausing #{next_pause}s before next file is deleted."
+    sleep next_pause
+  end
+end
+print "\nAll #{test_files_created.length} files deleted via the API. \nWaiting for files to be removed locally."
+while !LOCAL_DELETE_STATUS.fetch(:ready)
+  print '.'
+  $stdout.flush
+  sleep 2
+end
+
+puts "\n\nAPI to local drive test complete:\n\n"
+puts "#{ITERATION_HISTORY.first.keys.join(',')},web_sync_duration_from_upload_start,web_sync_duration_from_upload_complete"
+
+ITERATION_HISTORY.each do |iteration|
+  next if iteration.fetch(:id) < test_offset
+  web_sync_duration_from_completed = iteration.fetch(:local_deleted_at).to_f - iteration.fetch(:api_delete_completed_at).to_f
+  web_sync_duration_from_start = iteration.fetch(:local_deleted_at).to_f - iteration.fetch(:api_delete_started_at).to_f
+  total_sync_time_from_start[:api_to_local_drive] += web_sync_duration_from_start
+  total_sync_time_from_completed[:api_to_local_drive] += web_sync_duration_from_completed
+  puts (iteration.values + [web_sync_duration_from_start, web_sync_duration_from_completed]).join(',')
+end
+
+puts "\n--- DROPBOX ---\n\n"
+puts "Average web sync time from start of API upload: #{(total_sync_time_from_start[:api_to_web] / TEST_ITERATIONS).round(2)}s"
+puts "Average web sync time from API upload complete: #{(total_sync_time_from_completed[:api_to_web] / TEST_ITERATIONS).round(2)}s"
+
 puts "\n"
-puts "Average web sync time from start of upload: #{(total_sync_time_from_start / TEST_ITERATIONS).round(2)}s"
-puts "Average web sync time from upload complete: #{(total_sync_time_from_completed / TEST_ITERATIONS).round(2)}s"
+puts "Average web sync time from local drive write: #{(total_sync_time_from_completed[:local_drive_to_web] / TEST_ITERATIONS).round(2)}s"
+
+puts "\n"
+puts "Average local drive sync time from start of API delete: #{(total_sync_time_from_start[:api_to_local_drive] / TEST_ITERATIONS).round(2)}s"
+puts "Average local drive sync time from API delete complete: #{(total_sync_time_from_completed[:api_to_local_drive] / TEST_ITERATIONS).round(2)}s"
