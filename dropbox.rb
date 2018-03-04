@@ -2,9 +2,7 @@
 
 require 'securerandom'
 
-# Uses Gem https://github.com/gimite/google-drive-ruby for reading/writing files to Google Drive
-# The official Google SDK is overly complicated for a trivial example like this
-require 'google_drive'
+require 'dropbox_api'
 
 # Web server to listen for timestamps from web interface, using ngrok to get a public interface
 require 'clipboard'
@@ -15,8 +13,8 @@ require 'sinatra/base'
 require 'thread'
 MUTEX = Mutex.new
 
-PERF_FOLDER = 'GoogleDrivePerfTest'
-DRIVE_HOME_FOLDER = '~/Google Drive File Stream/My Drive'
+PERF_FOLDER = 'DropboxPerfTest'
+DRIVE_HOME_FOLDER = '~/Dropbox'
 FILE_NAME_PREFIX = 'iteration'
 
 TEST_ID = SecureRandom.hex(3)
@@ -81,33 +79,30 @@ if !WEB_SERVER_STATE[:pinged]
 end
 puts "Web server is now accessible externally at #{Ngrok::Tunnel.ngrok_url_https}"
 
-# Creates a Google Drive session. This will prompt the credential via command line for the
-# first time and save it to config.json file for later usages.
-# See this document to learn how to create config.json:
-# https://github.com/gimite/google-drive-ruby/blob/master/doc/authorization.md
-drive_session = GoogleDrive::Session.from_config('google_drive_config.json')
+dropbox_config = File.read(File.expand_path("../dropbox_config.json", __FILE__))
+access_token = JSON.parse(dropbox_config).fetch('access_token') { raise 'access_token attribute is missing' }
+dropbox_client = DropboxApi::Client.new(access_token)
 
-root = drive_session.root_collection
-perf_collection = root.subcollections.find { |folder| folder.title == PERF_FOLDER }
-if perf_collection.nil?
+root = dropbox_client.list_folder('').entries
+if root.find { |folder| folder.name == PERF_FOLDER }.nil?
   puts "Creating new folder '#{PERF_FOLDER}' in root"
-  perf_collection = root.create_subcollection(PERF_FOLDER)
+  dropbox_client.create_folder "/#{PERF_FOLDER}"
 end
 
-test_folder_path = "#{PERF_FOLDER}/#{TEST_ID}"
+test_folder_path = "/#{PERF_FOLDER}/#{TEST_ID}"
 puts "Creating test folder '#{test_folder_path}'"
-test_collection = perf_collection.create_subcollection(TEST_ID)
+dropbox_client.create_folder test_folder_path
 
 puts "Would you like me to open your browser now to the test folder '#{test_folder_path}' automatically? [y/n]"
 if gets.chomp.match(/^y/i)
   require 'launchy'
-  Launchy.open("https://drive.google.com/drive/u/0/folders/#{test_collection.id}")
+  Launchy.open("https://www.dropbox.com/home#{test_folder_path}")
 end
 
 javascript = <<EOM
   (function() {
-    let folder = document.querySelector('div[role="presentation"] div[role="listbox"]');
-    let filesSelector = 'div[data-target=doc] > div > div > div > div > div[aria-label] span[data-is-doc-name=true]';
+    let folder = document.querySelector('div.brws-files-view');
+    let filesSelector = 'table.mc-table.brws-files-view-list tr.brws-file-row';
     let filesByName = [];
 
     if (!folder) { throw('Could not find listbox DOM element. Did you run this script before the page rendered?'); }
@@ -118,7 +113,7 @@ javascript = <<EOM
     let timer = setInterval(() => {
       let files = folder.querySelectorAll(filesSelector);
       files.forEach((element) => {
-        let fileName = element.innerHTML;
+        let fileName = element.getAttribute('data-filename');
         if (fileName) {
           if (!filesByName.includes(fileName)) {
             let request = new XMLHttpRequest();
@@ -146,7 +141,7 @@ javascript = <<EOM
   })();
 EOM
 
-puts "Run this Javascript in your browser console for the Google Drive web view of the folder so we can track how long it takes for the files to sync:\n\n\n"
+puts "Run this Javascript in your browser console for the Dropbox web view of the folder so we can track how long it takes for the files to sync:\n\n\n"
 puts javascript
 Clipboard.copy javascript
 
@@ -158,12 +153,12 @@ while !WEB_SERVER_STATE[:ready]
   sleep 2
 end
 
-puts "\n\nTest will now commence by uploading #{TEST_ITERATIONS} files to Google Drive"
+puts "\n\nTest will now commence by uploading #{TEST_ITERATIONS} files to Dropbox"
 
 TEST_ITERATIONS.times do |index|
   iteration_data = { id: index, upload_started_at: Time.now }
   ITERATION_HISTORY << iteration_data
-  test_collection.upload_from_string("<empty>", "#{FILE_NAME_PREFIX}-#{index}.txt", :content_type => "text/plain")
+  dropbox_client.upload "#{test_folder_path}/#{FILE_NAME_PREFIX}-#{index}.txt", "<empty>"
   iteration_data[:upload_completed_at] = Time.now
   next_pause = rand(TEST_PAUSE_RANGE).round
   puts "Uploaded test file with index #{index} successfully in #{(iteration_data.fetch(:upload_completed_at).to_f - iteration_data.fetch(:upload_started_at).to_f).round(2)}s. Pausing #{next_pause}s before next upload."
@@ -173,7 +168,7 @@ end
 puts "\n\nWaiting for files to be synchronized..."
 sleep 1 while (ITERATION_HISTORY.length != TEST_ITERATIONS) || !ITERATION_HISTORY.all? { |iteration| iteration[:web_sync_at] }
 
-puts "\n\nGoogle Drive performance test complete:\n\n"
+puts "\n\nDropbox performance test complete:\n\n"
 puts "#{ITERATION_HISTORY.first.keys.join(',')},web_sync_duration_from_upload_start,web_sync_duration_from_upload_complete"
 total_sync_time_from_start = 0
 total_sync_time_from_completed = 0

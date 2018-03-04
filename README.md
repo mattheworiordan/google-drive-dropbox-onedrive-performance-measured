@@ -1,3 +1,111 @@
+# Dropbox vs Google Drive - measuring realtime synchronization performance
+
+Following a migration from Dropbox to Google Drive for [my team at Ably Realtime](https://www.ably.io/about/team) in Jan 2018, I noticed that following the migration, files were often out of sync and updates felt sluggish across the board. Whilst the liveness of content is certainly not the only factor in choosing the right cloud based drive solution, I believe that when an online service's user experience lets you down (unreliable sync, slow etc), then you can quickly lose trust in the product. I've seen this first hand now as our team has progressively resorted to emailing files to each other or sharing them on Slack.
+
+Given latencies significantly impact user experience for products where people are collaborating, and as far as I can tell no one yet has measured performance of Dropbox vs Google from a latency perspective, I took it upon myself to compare the two products in a reasonably scientific and reproduceable way.
+
+## Summary of findings
+
+* Dropbox is fast (typically 0.5 to 2s to sync a change). Everything feels like it's happening in real time, and it just works, every time. I've identified lots of technical ways they can improve further and significantly reduce their infrastructure costs. However, in spite of opportunities they have to improve, I have to admit their solution is very good.
+* Google Drive & the Google Drive File Stream service is very slow, unreliable, and has lots of synchronization issues. Latencies to update changes vary immensely (from 1s to 2 minutes) with an average of around 45s. Worse still, their are fundamental issues with their synchronization using their Google Drive File Stream product meaning you cannot rely on your files to be in sync, ever.
+
+# Dropbox Performance Tests
+
+Summary of results:
+
+* Average latencies range from 0.5s to 2s for the web interface to reflect changes made via the Dropbox API.
+* At present, I am not measuring the time it takes for a file to sync to a local folder. I will work on that next.
+
+##  Setup
+
+* Before you can run the tests, you will need to get an access token from Dropbox. Go to the [Dropbox developers section](https://www.dropbox.com/developers) and login, then go to "My apps", and select your application or create one if you haven't done so yet. Once you are viewing your app, look for the "Generate" button under "Generated access token" and generate a new token. Save this access token in `dropbox_config.json` in the root of this repo. See an example JSON config file at [./dropbox_config.json.example](./dropbox_config.json.example)
+* Use bundler to install the required Gem dependencies with `bundle install`
+
+## Running the tests
+
+Run [`ruby dropbox.rb`](./dropbox.rb). When prompted to open a browser, respond with `y` and then paste the Javascript provided (which is automatically added to your clipboard) into the dev console so that web sync latencies can be measured.
+
+## Dropbox Tech Notes
+
+### Transports
+
+Dropbox relies on a long poll mechanism to receive notifications of updates. In all likelihood the system behind this feature for apps is probably very similar to the API they offer customers to programatically get a feed of updates, see https://www.dropbox.com/developers/documentation/http/documentation#files-list_folder-longpoll (Drobox also support Webhooks https://www.dropbox.com/developers/reference/webhooks).
+
+Each long poll HTTP/1.1 request is a `POST` request to `https://bolt.dropbox.com/2/notify/subscribe` with a significant POST payload as follows:
+
+```json
+{
+   "channel_states":[
+      {
+         "channel_id":{
+            "app_id":"sfj",
+            "unique_id":"63098240"
+         },
+         "revision":"13075",
+         "token":"{{OBFUSCATED}}"
+      },
+      {
+         "channel_id":{
+            "app_id":"sfj",
+            "unique_id":"2712962"
+         },
+         "revision":"1039486140",
+         "token":"{{OBFUSCATED}}"
+      },
+      .... around 48 of these channel_states ...
+      {
+         "channel_id":{
+            "app_id":"sfj",
+            "unique_id":"1229659005"
+         },
+         "revision":"1",
+         "token":"{{OBFUSCATED}}"
+      }
+   ]
+}
+```
+
+In response, the following payload is returned if a change occurs (or the request is sent `{}` and closed if there is no activity for roughly 40s):
+
+```
+{
+   "channel_states":[
+      {
+         "channel_id":{
+            "app_id":"sfj",
+            "unique_id":"2712962"
+         },
+         "revision":"1039486141",
+         "token":"{{OBFUSCATED}}"
+      }
+   ]
+}
+```
+
+And this in turn triggers a lot of HTTP requests:
+
+* `GET https://www.dropbox.com/update/list_dir` (9.1KB)
+* `POST https://www.dropbox.com/share_ajax/shared_with` (2.0KB)
+* `POST https://www.dropbox.com/sm/get_token_info` (1.7KB)
+* `POST https://www.dropbox.com/2/sharing/list_file_members/batch` (0.5KB)
+* `POST https://www.dropbox.com/file_activity/comment_status_batch` (1.8KB)
+* `POST https://www.dropbox.com/unity_connection_log` (1.6KB)
+* `POST https://www.dropbox.com/starred/get_status` (1.8KB)
+* And of course a new long poll `OPTIONS https://bolt.dropbox.com/2/notify/subscribe` and `POST https://bolt.dropbox.com/2/notify/subscribe` (0.2KB)
+
+So a total 9 requests and 18.7KB ingress, and a fair chunk egress given the `POST` body can grow quite large.
+
+### Performance
+
+* Dropbox is noticeably speedy. It was so fast that I had to rewrite some of the code I had written as I was measuring time from completed upload until when it appears in the UI. Sometimes files were appearing in the UI before the HTTP API upload request had completed!
+* In spite of the fact that Dropbox is faster, the inefficiencies are incredible. A single file change, that should at best be in the KB range, results in 9 HTTP/1.1 requests and circa 20KB of traffix. Using a smarter duplexed transport such as Websockets would allow the Dropbox client to efficiently communicate what it is listening for, and simply get the updates it needs. According to stats from Aug 2016, 1.2 billion files are uploaded to Dropbox every day, which I assume would result in at least twice that many interface updates (multiple tabs, multiple devices, sharing, changes other than uploads).  If each update results in 19KB more traffic than is necessary, that is a staggering 45TB a day or 1.4 Petabytes per month.  Assuming that's an average bandwidth cost of $0.10 per GB, this inefficiency from just a bandwidth perspective amounts to circa $1.5m per year, not accounting for the hardware costs.
+* Long polling is just inefficient and there is little excuse to use this approach in 2018. Dropbox reportedly has half a billion users, which assuming one in five is connected at any point in time, this would result in 150 million new long poll HTTP requests per minute. I certainly appreciate that the underlying TCP/IP connection is reused with HTTP keep-alives, but regardless, this approach of effectively polling every 40s instead of waiting for updates must cost Dropbox a considerable amount of money and significantly complicate their stack.
+
+### Other
+
+Dropbox appear to have an odd dependency that is trying to open Websocket connections to `localhost`, I can only assume that's not intentional and someone's left some debugging code in the production codebase.
+`web_socket-vflPfL4KL.ts:37 WebSocket connection to 'ws://127.0.0.1:17602/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED`
+
 # Google Drive Performance Tests
 
 Summary of results:
